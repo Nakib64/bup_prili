@@ -264,3 +264,110 @@ export function validateAndSanitizeDirectives(rawInterpretations, notesInput = [
 
   return sanitized;
 }
+
+export function replayValidateSchedule(plan, directive_interpretation = [], hours = [], battery = {}) {
+  const B_CAP = battery.capacity_kwh ?? 220;
+  const B_INIT = battery.initial_energy_kwh ?? 110;
+  const B_MIN = battery.minimum_energy_kwh ?? 40;
+  const B_MAX_CHG = battery.max_charge_kwh_per_hour ?? 50;
+  const B_MAX_DIS = battery.max_discharge_kwh_per_hour ?? 50;
+
+  if (!plan || !Array.isArray(plan.hourly_plan) || plan.hourly_plan.length !== 24) {
+    throw new Error("Replay validation error: hourly_plan must contain exactly 24 hours.");
+  }
+
+  // Pre-index directives
+  const noChargeHours = new Set();
+  const noDischargeHours = new Set();
+  const minReserveHours = new Map();
+  const maxGridHours = new Map();
+  const solarFactorMap = new Map();
+
+  for (const d of directive_interpretation) {
+    if (!d.applies || !d.structured_adjustment) continue;
+    const targetHours = d.structured_adjustment.hours || [];
+    for (const h of targetHours) {
+      if (d.directive_type === "no_charge_window") noChargeHours.add(h);
+      if (d.directive_type === "no_discharge_window") noDischargeHours.add(h);
+      if (d.directive_type === "minimum_battery_reserve") {
+        const current = minReserveHours.get(h) ?? B_MIN;
+        minReserveHours.set(h, Math.max(current, d.structured_adjustment.minimum_energy_kwh ?? 0));
+      }
+      if (d.directive_type === "max_grid_window") {
+        const current = maxGridHours.get(h) ?? Infinity;
+        maxGridHours.set(h, Math.min(current, d.structured_adjustment.max_grid_kwh ?? Infinity));
+      }
+      if (d.directive_type === "solar_reduction") {
+        const current = solarFactorMap.get(h) ?? 1.0;
+        solarFactorMap.set(h, Math.min(current, d.structured_adjustment.factor ?? 1.0));
+      }
+    }
+  }
+
+  let runningBattery = B_INIT;
+  let recalculatedTotalGrid = 0;
+  let recalculatedTotalCost = 0;
+  let recalculatedPeakGrid = 0;
+
+  for (let h = 0; h < 24; h++) {
+    const entry = plan.hourly_plan[h];
+    const hrIn = hours[h] || {};
+    const demand = hrIn.demand_kwh ?? 0;
+    const tariff = hrIn.tariff_bdt_per_kwh ?? hrIn.grid_import_price ?? 10;
+    const rawSolar = hrIn.solar_kwh ?? hrIn.solar_forecast_kwh ?? 0;
+    const maxAllowedSolar = Number((rawSolar * (solarFactorMap.get(h) ?? 1.0)).toFixed(2));
+
+    // 1. Directives enforcement: solar
+    if (entry.solar_used_kwh > maxAllowedSolar + 0.05) {
+      entry.solar_used_kwh = maxAllowedSolar;
+    }
+
+    // 2. Directives enforcement: charge & discharge windows
+    if (noChargeHours.has(h) && entry.battery_action === "charge") {
+      entry.battery_action = "idle";
+      entry.battery_kwh = 0;
+    }
+    if (noDischargeHours.has(h) && entry.battery_action === "discharge") {
+      entry.battery_action = "idle";
+      entry.battery_kwh = 0;
+    }
+
+    // Rate limits
+    if (entry.battery_action === "charge" && entry.battery_kwh > B_MAX_CHG) {
+      entry.battery_kwh = B_MAX_CHG;
+    }
+    if (entry.battery_action === "discharge" && entry.battery_kwh > B_MAX_DIS) {
+      entry.battery_kwh = B_MAX_DIS;
+    }
+
+    const chg = entry.battery_action === "charge" ? entry.battery_kwh : 0;
+    const dis = entry.battery_action === "discharge" ? entry.battery_kwh : 0;
+
+    // 3. Exact physical power balance
+    const requiredGrid = Math.max(0, demand + chg - dis - entry.solar_used_kwh);
+    entry.grid_kwh = Number(requiredGrid.toFixed(2));
+
+    // 4. Continuity update
+    runningBattery = Math.round((runningBattery + chg - dis) * 100) / 100;
+    entry.battery_energy_after_kwh = runningBattery;
+
+    // Accumulate metrics
+    recalculatedTotalGrid += entry.grid_kwh;
+    recalculatedTotalCost += entry.grid_kwh * tariff;
+    if (entry.grid_kwh > recalculatedPeakGrid) {
+      recalculatedPeakGrid = entry.grid_kwh;
+    }
+  }
+
+  // 5. End-of-day battery neutrality
+  if (Math.abs(runningBattery - B_INIT) < 0.05) {
+    plan.hourly_plan[23].battery_energy_after_kwh = B_INIT;
+  }
+
+  // 6. Enforce recalculated mathematical accounting
+  plan.total_grid_kwh = Number(recalculatedTotalGrid.toFixed(1));
+  plan.total_cost_bdt = Math.round(recalculatedTotalCost);
+  plan.peak_grid_kwh = Number(recalculatedPeakGrid.toFixed(1));
+
+  return plan;
+}
