@@ -36,43 +36,55 @@ flowchart TD
 
 ### 2. LLM Operator Note Interpretation (`services/aiServices.js`)
 - Primary extraction pipeline powered by OpenRouter.
-- The prompt is dynamically injected with the campus `batteryCapacity` to allow the LLM to calculate exact percentage-based reserve requirements (e.g., *"keep 50% in the battery"* on a 200 kWh system $\to 100\text{ kWh}$).
+- The prompt is dynamically injected with the campus `batteryCapacity` to allow the LLM to calculate exact percentage-based reserve requirements (e.g., *"keep 50% in the battery"* on a 200 kWh system → `100 kWh`).
 - Enforces strict JSON Schema with 6 supported directive types:
-  1. `solar_reduction`: Usable solar fraction remaining (e.g., 80% reduction $\to \text{factor} = 0.20$).
+  1. `solar_reduction`: Usable solar fraction remaining (e.g., 80% reduction → `factor = 0.20`).
   2. `minimum_battery_reserve`: Elevated minimum state-of-charge during emergency/testing windows.
   3. `no_charge_window`: Complete charger isolation/outage hours.
   4. `no_discharge_window`: Disallow battery discharge during relay/protection testing.
   5. `max_grid_window`: Feeder, transformer, or substation grid import ceiling (kWh).
   6. `no_op`: Irrelevant distractors (campus news, registration deadlines, library notices).
-- Operates in whole-hour intervals (0–23), start-inclusive and end-exclusive (e.g., "noon until 2 PM" $\to [12, 13]$).
+- Operates in whole-hour intervals (0–23), start-inclusive and end-exclusive (e.g., "noon until 2 PM" → `[12, 13]`).
 
 ### 3. Deterministic Guardrails (`services/guardrails.js`)
 - Sanitizes LLM outputs against physical boundary bounds:
-  - Clamps `factor` between $0.0$ and $1.0$.
-  - Clamps `minimum_energy_kwh` between $0$ and `batteryCapacity`.
-  - Normalizes and sorts hour intervals $[0 \dots 23]$.
+  - Clamps `factor` between `0.0` and `1.0`.
+  - Clamps `minimum_energy_kwh` between `0` and `batteryCapacity`.
+  - Normalizes and sorts hour intervals `[0 ... 23]`.
   - Forces `applies: false` and `structured_adjustment: null` on `no_op`.
 - Includes a regex-based fallback to preserve uptime if the external LLM provider encounters network outages or upstream rate limits.
 
 ### 4. Linear Programming Optimizer (`services/optimizerService.js`)
 - Built on `javascript-lp-solver`.
 - **Objective Function**: Minimize total grid import expenditure:
-  $$\min \sum_{h=0}^{23} (\text{grid\_kwh}_h \times \text{tariff\_bdt\_per\_kwh}_h) + \epsilon \cdot (\text{charge}_h + \text{discharge}_h) + \epsilon_{\text{peak}} \cdot \text{peak\_grid}$$
+  ```text
+  minimize Cost = Σ [ grid_kwh[h] × tariff_bdt_per_kwh[h] ] + ε · (charge[h] + discharge[h]) + ε_peak · peak_grid
+  ```
 - **Physical Constraints**:
-  - **Power Balance**: $\text{grid\_kwh}_h + \text{solar\_used\_kwh}_h + \text{discharge}_h = \text{demand\_kwh}_h + \text{charge}_h$
-  - **Battery Bounds**: $\text{active\_min\_reserve}_h \le \text{SoC}_h \le \text{capacity\_kwh}$
-  - **Inverter Limits**: $\text{charge}_h \le \text{max\_charge}$, $\text{discharge}_h \le \text{max\_discharge}$
-  - **Directive Enforcement**: Grid ceilings, charge/discharge window disablement, and solar derating.
-  - **End-of-Day Neutrality**: $\text{SoC}_{23} = \text{SoC}_{\text{init}}$ (strictly enforced with net zero balance constraint $\sum \text{chg} = \sum \text{dis}$).
+  - **Power Balance**:
+    `grid_kwh[h] + solar_used_kwh[h] + discharge[h] = demand_kwh[h] + charge[h]`
+  - **Battery Storage Bounds**:
+    `active_min_reserve[h] <= SoC[h] <= capacity_kwh`
+  - **Inverter Hourly Limits**:
+    `charge[h] <= max_charge_kwh_per_hour`  
+    `discharge[h] <= max_discharge_kwh_per_hour`
+  - **Directive Enforcement**:
+    - `no_charge_window`: `charge[h] = 0`
+    - `no_discharge_window`: `discharge[h] = 0`
+    - `max_grid_window`: `grid_kwh[h] <= max_grid_kwh`
+    - `solar_reduction`: `usable_solar[h] = raw_solar[h] × factor`
+  - **End-of-Day Neutrality**:
+    `SoC[23] = initial_energy_kwh` (strictly enforced with zero-balance constraint `Σ charge = Σ discharge`).
 
 ### 5. Section 08 Replay Validator (`services/guardrails.js`)
 - Post-optimization verification step executed before returning the schedule to the client:
   - Replays all 24 hours against extracted directives to ensure no constraint was breached.
-  - Re-evaluates exact physical power balance and battery continuity $\text{SoC}_h = \text{SoC}_{h-1} + \text{charge}_h - \text{discharge}_h$.
+  - Re-evaluates exact physical power balance and battery continuity:
+    `SoC[h] = SoC[h-1] + charge[h] - discharge[h]`
   - Recalculates mathematical summary totals:
-    - $\text{total\_grid\_kwh} = \sum \text{grid\_kwh}_h$
-    - $\text{total\_cost\_bdt} = \text{round}\left(\sum \text{grid\_kwh}_h \times \text{tariff}_h\right)$
-    - $\text{peak\_grid\_kwh} = \max(\text{grid\_kwh}_h)$
+    - `total_grid_kwh = Σ grid_kwh[h]`
+    - `total_cost_bdt = round( Σ (grid_kwh[h] × tariff[h]) )`
+    - `peak_grid_kwh = max( grid_kwh[h] )`
 
 ---
 
@@ -248,9 +260,9 @@ Summary: 10 / 10 cases passed.
 
 | Edge Case | Strategy |
 |---|---|
-| **Ambiguous Percentage Reserves** | System prompt passes battery capacity so the LLM evaluates exact numbers ($X\% \times C_{\text{battery}}$). |
+| **Ambiguous Percentage Reserves** | System prompt passes battery capacity so the LLM evaluates exact numbers (`percentage% × capacity_kwh`). |
 | **Malformed LLM Output** | Robust JSON extraction isolates outermost `{...}` braces; invalid outputs route to the deterministic parser. |
-| **Hour Window Parsing** | Standardizes "noon", "midnight", AM/PM, and 24-hour time to zero-indexed half-open intervals $[t_{\text{start}}, t_{\text{end}})$. |
+| **Hour Window Parsing** | Standardizes "noon", "midnight", AM/PM, and 24-hour time to zero-indexed half-open intervals `[start, end)`. |
 | **Simultaneous Chg/Dischg** | Micro-penalties on battery turnover variables prevent wasteful cycling during identical tariff intervals. |
-| **End-of-Day Neutrality** | Constrains net energy flux to zero ($\sum \text{charge} - \sum \text{discharge} = 0$), guaranteeing $\text{SoC}_{23} = \text{SoC}_{\text{init}}$. |
-| **Accounting Discrepancies** | Replay Validator re-aggregates $\sum \text{grid}$ and $\sum (\text{grid} \times \text{tariff})$ directly from final hourly actions. |
+| **End-of-Day Neutrality** | Constrains net energy flux to zero (`Σ charge - Σ discharge = 0`), guaranteeing `SoC[23] = initial_energy_kwh`. |
+| **Accounting Discrepancies** | Replay Validator re-aggregates `Σ grid` and `Σ (grid × tariff)` directly from final hourly actions. |
