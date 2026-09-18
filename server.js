@@ -2,6 +2,7 @@ import express from "express";
 import dotenv from "dotenv";
 import { interpretOperatorNotes } from "./services/aiServices.js";
 import { validateAndSanitizeDirectives } from "./services/guardrails.js";
+import { optimizeEnergySchedule } from "./services/optimizerService.js";
 
 dotenv.config();
 
@@ -13,34 +14,26 @@ app.get("/health", (req, res) => {
   return res.status(200).json({ status: "ok" });
 });
 
-// 2. Main Optimization Endpoint (AI test implementation)
+// 2. Main Optimization Endpoint
 app.post("/optimize-energy", async (req, res) => {
   try {
-    const { scenario_id, operator_notes, hours, battery } = req.body;
+    const { scenario_id, operator_notes = [], hours = [], battery = {} } = req.body;
 
-    // Basic request validation
-    if (!scenario_id || !Array.isArray(operator_notes) || !Array.isArray(hours) || !battery) {
-      return res.status(400).json({ error: "Invalid request payload schema." });
-    }
+    // 1. Directives parsing & guardrail sanitization
+    const rawDirectives = await interpretOperatorNotes(operator_notes);
+    const validatedDirectives = validateAndSanitizeDirectives(rawDirectives, operator_notes, battery?.capacity_kwh ?? 220);
 
-    // Step 1: LLM interpretation via OpenRouter
-    const rawInterpretations = await interpretOperatorNotes(operator_notes);
-
-    // Step 2: Deterministic Guardrails
-    const validatedDirectives = validateAndSanitizeDirectives(
-      rawInterpretations,
-      operator_notes.length,
-      battery.capacity_kwh
-    );
-
-    // Return the interpretation stage for testing
-    return res.status(200).json({
+    // 2. Run Optimization Solver
+    const plan = optimizeEnergySchedule({
       scenario_id,
       directive_interpretation: validatedDirectives,
-      message: "AI interpretation and guardrails passed. Ready for optimizer step.",
+      hours,
+      battery,
     });
-  } catch (error) {
-    console.error("Error processing request:", error);
+
+    return res.json(plan);
+  } catch (err) {
+    console.error("Optimization endpoint failed:", err);
     return res.status(500).json({ error: "Internal server error occurred." });
   }
 });
